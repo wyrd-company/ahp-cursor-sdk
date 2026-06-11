@@ -6,6 +6,12 @@ Package target: `@wyrd-company/ahp-cursor-sdk`.
 
 This package is intentionally separate from `@wyrd-company/ahp-server` because `@cursor/sdk` brings native optional packages. Consumers explicitly import this adapter and register it with an AHP server.
 
+## Current Status
+
+Implementation is on hold pending an upstream Cursor SDK issue. The adapter requests local agents with `Agent.create({ apiKey, local: { cwd, customTools } })`, but Cursor SDK local agent creation currently fails for free users because local model validation calls a cloud models endpoint and returns `plan_required`.
+
+Reference: https://forum.cursor.com/t/agent-create-local-apikey-model-fails-for-free-users-because-local-model-validation-calls-cloud-v1-models/160839/10
+
 ## Behavior
 
 - Creates one local Cursor SDK agent per AHP session.
