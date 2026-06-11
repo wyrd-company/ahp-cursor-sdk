@@ -8,7 +8,7 @@ tags:
   - validation
 lifecycle: permanent
 createdAt: '2026-06-11T01:54:45.503Z'
-updatedAt: '2026-06-11T01:54:45.503Z'
+updatedAt: '2026-06-11T02:20:48.971Z'
 role: summary
 alwaysLoad: false
 project: github-com-wyrd-company-ahp-cursor-sdk
@@ -29,3 +29,9 @@ Key implementation details:
 - Cancellation uses `run.cancel()` when supported. Disposal uses `agent[Symbol.asyncDispose]()` when available.
 
 Validation: `npm run verify` passed. Local tests cover streaming, active-client tool replacement before a turn, trusted AHP tool lifecycle events, rejection of completion from another client, owner completion, and Cursor custom tool result conversion. The live test is gated on `CURSOR_API_KEY` and was skipped without credentials.
+
+## Upstream Hold
+
+Cursor SDK execution is on hold as of 2026-06-11 due to an upstream SDK bug confirmed by Bob: `Agent.create({ apiKey, local: { cwd, customTools } })` requests a local agent, but local model validation calls Cursor's cloud `/v1/models` path and fails for free users with `plan_required`. Reference: <https://forum.cursor.com/t/agent-create-local-apikey-model-fails-for-free-users-because-local-model-validation-calls-cloud-v1-models/160839/10>
+
+The implemented adapter and fake-runtime tests remain useful, but live Cursor SDK validation should not be treated as actionable until Cursor fixes the SDK behavior or a paid-capable account/API key is provided.
