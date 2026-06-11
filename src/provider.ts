@@ -1,0 +1,306 @@
+import { randomUUID } from 'node:crypto';
+import { fileURLToPath } from 'node:url';
+
+import type {
+  AgentInfo,
+  Message,
+  ModelSelection,
+  StateAction,
+  ToolCallResult,
+  ToolDefinition,
+  URI,
+} from '@microsoft/agent-host-protocol';
+import type {
+  ActiveClientToolSink,
+  ActiveClientTools,
+  AgentProvider,
+  AgentSession,
+  AgentSessionContext,
+  AgentTurnSink,
+} from '@wyrd-company/ahp-server';
+
+import { createCursorSdkRuntime } from './runtime.js';
+import {
+  toolDefinitionInputSchema,
+  toolResultText,
+  type CursorSdkAgent,
+  type CursorSdkCustomToolResult,
+  type CursorSdkCustomTools,
+  type CursorSdkMessage,
+  type CursorSdkRun,
+  type CursorSdkRuntime,
+} from './types.js';
+
+export interface CursorSdkProviderOptions {
+  readonly apiKey?: string;
+  readonly runtime?: CursorSdkRuntime;
+  readonly providerId?: string;
+  readonly displayName?: string;
+  readonly description?: string;
+  readonly defaultModel?: string;
+  readonly agentName?: string;
+  readonly localForce?: boolean;
+}
+
+export function createCursorSdkProvider(options: CursorSdkProviderOptions = {}): AgentProvider {
+  const providerId = options.providerId ?? 'cursor-sdk';
+  const defaultModel = options.defaultModel ?? 'composer-2';
+  const agent: AgentInfo = {
+    provider: providerId,
+    displayName: options.displayName ?? 'Cursor SDK',
+    description: options.description ?? 'Cursor SDK local agent adapter',
+    models: [
+      {
+        id: defaultModel,
+        provider: providerId,
+        name: defaultModel,
+      },
+    ],
+  };
+
+  return {
+    agent,
+    async createSession(context: AgentSessionContext): Promise<AgentSession> {
+      const runtime = options.runtime ?? createCursorSdkRuntime();
+      const cwd = context.workingDirectory ? uriToPath(context.workingDirectory) : process.cwd();
+      const model = modelId(context.model, defaultModel);
+      const session = new CursorSdkAHPAgentSession({
+        runtime,
+        apiKey: options.apiKey ?? process.env.CURSOR_API_KEY,
+        agentName: options.agentName ?? 'AHP Cursor SDK',
+        cwd,
+        model,
+        localForce: options.localForce,
+        activeClientTools: context.activeClientTools,
+        activeClientToolSink: context.activeClientToolSink,
+      });
+      await session.start();
+      return session;
+    },
+  };
+}
+
+interface CursorSdkAHPAgentSessionOptions {
+  readonly runtime: CursorSdkRuntime;
+  readonly apiKey?: string;
+  readonly agentName: string;
+  readonly cwd: string;
+  readonly model: string;
+  readonly localForce?: boolean;
+  readonly activeClientTools?: ActiveClientTools;
+  readonly activeClientToolSink: ActiveClientToolSink;
+}
+
+class CursorSdkAHPAgentSession implements AgentSession {
+  private activeClientTools: ActiveClientTools | undefined;
+  private currentTurnId: string | undefined;
+  private agent: CursorSdkAgent | undefined;
+  private run: CursorSdkRun | undefined;
+
+  constructor(private readonly options: CursorSdkAHPAgentSessionOptions) {
+    this.activeClientTools = options.activeClientTools;
+  }
+
+  async start(): Promise<void> {
+    this.agent = await this.options.runtime.createAgent({
+      apiKey: this.options.apiKey,
+      name: this.options.agentName,
+      model: { id: this.options.model },
+      local: {
+        cwd: this.options.cwd,
+        customTools: this.customTools(),
+      },
+    });
+  }
+
+  async sendUserMessage(message: Message, sink: AgentTurnSink, signal: AbortSignal, turnId?: string): Promise<void> {
+    const agent = this.agent;
+    if (!agent) {
+      throw new Error('Cursor SDK agent session is not started');
+    }
+
+    const ahpTurnId = turnId ?? `turn-${Date.now()}`;
+    const partId = `${ahpTurnId}:markdown`;
+    let partEmitted = false;
+    this.currentTurnId = ahpTurnId;
+
+    try {
+      const run = await agent.send(message.text, {
+        model: { id: this.options.model },
+        local: {
+          ...(this.options.localForce ? { force: true } : {}),
+          customTools: this.customTools(),
+        },
+      });
+      this.run = run;
+
+      const abort = (): void => {
+        void this.cancel().catch(() => undefined);
+      };
+      if (signal.aborted) {
+        abort();
+        return;
+      }
+      signal.addEventListener('abort', abort, { once: true });
+
+      try {
+        for await (const event of run.stream()) {
+          if (signal.aborted) {
+            return;
+          }
+          partEmitted = emitCursorEvent(event, sink, ahpTurnId, partId, partEmitted);
+        }
+
+        const result = await run.wait();
+        if (!partEmitted && result.result) {
+          partEmitted = true;
+          sink.emit(markdownPart(ahpTurnId, partId));
+          sink.emit({
+            type: 'session/delta',
+            turnId: ahpTurnId,
+            partId,
+            content: result.result,
+          } as StateAction);
+        }
+        if (!partEmitted) {
+          sink.emit(markdownPart(ahpTurnId, partId));
+        }
+        sink.emit({
+          type: 'session/turnComplete',
+          turnId: ahpTurnId,
+        } as StateAction);
+      } finally {
+        signal.removeEventListener('abort', abort);
+      }
+    } finally {
+      this.run = undefined;
+      this.currentTurnId = undefined;
+    }
+  }
+
+  setActiveClientTools(activeClientTools: ActiveClientTools | undefined): void {
+    this.activeClientTools = activeClientTools;
+  }
+
+  async cancel(): Promise<void> {
+    const run = this.run;
+    if (!run) {
+      return;
+    }
+    if (run.supports && !run.supports('cancel')) {
+      return;
+    }
+    await run.cancel?.();
+  }
+
+  async dispose(): Promise<void> {
+    const dispose = this.agent?.[Symbol.asyncDispose];
+    if (dispose) {
+      await dispose.call(this.agent);
+      return;
+    }
+    this.agent?.close?.();
+  }
+
+  private customTools(): CursorSdkCustomTools | undefined {
+    const tools = this.activeClientTools?.tools;
+    if (!tools?.length) {
+      return undefined;
+    }
+    return Object.fromEntries(tools.map(tool => [tool.name, this.customTool(tool)]));
+  }
+
+  private customTool(tool: ToolDefinition): CursorSdkCustomTools[string] {
+    return {
+      ...(tool.description ? { description: tool.description } : {}),
+      ...(toolDefinitionInputSchema(tool) ? { inputSchema: toolDefinitionInputSchema(tool) } : {}),
+      execute: async (args, context): Promise<CursorSdkCustomToolResult> => {
+        const turnId = this.currentTurnId;
+        if (!turnId) {
+          return cursorToolResult({
+            success: false,
+            pastTenseMessage: `No active AHP turn is available for tool ${tool.name}`,
+          });
+        }
+        const result = await this.options.activeClientToolSink.reportInvocation({
+          turnId,
+          toolCallId: context.toolCallId ?? `cursor-tool-${randomUUID()}`,
+          toolName: tool.name,
+          displayName: tool.title ?? tool.name,
+          invocationMessage: tool.title ?? tool.name,
+          toolInput: JSON.stringify(args ?? {}),
+        });
+        return cursorToolResult(result);
+      },
+    };
+  }
+}
+
+function emitCursorEvent(
+  event: CursorSdkMessage,
+  sink: AgentTurnSink,
+  turnId: string,
+  partId: string,
+  partEmitted: boolean,
+): boolean {
+  if (!isAssistantMessage(event)) {
+    return partEmitted;
+  }
+
+  let emitted = partEmitted;
+  for (const block of event.message.content) {
+    if (block.type !== 'text') {
+      continue;
+    }
+    if (!emitted) {
+      emitted = true;
+      sink.emit(markdownPart(turnId, partId));
+    }
+    sink.emit({
+      type: 'session/delta',
+      turnId,
+      partId,
+      content: block.text,
+    } as StateAction);
+  }
+  return emitted;
+}
+
+function isAssistantMessage(event: CursorSdkMessage): event is Extract<CursorSdkMessage, { readonly type: 'assistant' }> {
+  return event.type === 'assistant' &&
+    typeof event.message === 'object' &&
+    event.message !== null &&
+    'content' in event.message &&
+    Array.isArray((event.message as { readonly content?: unknown }).content);
+}
+
+function cursorToolResult(result: ToolCallResult): CursorSdkCustomToolResult {
+  return {
+    isError: !result.success,
+    content: [{ type: 'text', text: toolResultText(result) }],
+    ...(result.structuredContent ? { structuredContent: result.structuredContent as Record<string, never> } : {}),
+  };
+}
+
+function markdownPart(turnId: string, partId: string): StateAction {
+  return {
+    type: 'session/responsePart',
+    turnId,
+    part: {
+      kind: 'markdown',
+      id: partId,
+      content: '',
+    },
+  } as StateAction;
+}
+
+function modelId(model: ModelSelection | undefined, fallback: string): string {
+  return model?.id ?? fallback;
+}
+
+function uriToPath(uri: URI): string {
+  if (!uri.startsWith('file://')) {
+    return uri;
+  }
+  return fileURLToPath(uri);
+}
