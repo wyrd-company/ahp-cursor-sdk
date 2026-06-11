@@ -1,22 +1,23 @@
 import { randomUUID } from 'node:crypto';
-import { fileURLToPath } from 'node:url';
 
 import type {
   AgentInfo,
   Message,
-  ModelSelection,
-  StateAction,
   ToolCallResult,
   ToolDefinition,
-  URI,
 } from '@microsoft/agent-host-protocol';
-import type {
-  ActiveClientToolSink,
-  ActiveClientTools,
-  AgentProvider,
-  AgentSession,
-  AgentSessionContext,
-  AgentTurnSink,
+import {
+  ActiveClientToolRouter,
+  MarkdownTurnEmitter,
+  resolveModelId,
+  singleModelAgentInfo,
+  uriToPath,
+  type ActiveClientTools,
+  type ActiveClientToolSink,
+  type AgentProvider,
+  type AgentSession,
+  type AgentSessionContext,
+  type AgentTurnSink,
 } from '@wyrd-company/ahp-server';
 
 import { createCursorSdkRuntime } from './runtime.js';
@@ -45,25 +46,19 @@ export interface CursorSdkProviderOptions {
 export function createCursorSdkProvider(options: CursorSdkProviderOptions = {}): AgentProvider {
   const providerId = options.providerId ?? 'cursor-sdk';
   const defaultModel = options.defaultModel ?? 'composer-2';
-  const agent: AgentInfo = {
-    provider: providerId,
+  const agent: AgentInfo = singleModelAgentInfo({
+    providerId,
     displayName: options.displayName ?? 'Cursor SDK',
     description: options.description ?? 'Cursor SDK local agent adapter',
-    models: [
-      {
-        id: defaultModel,
-        provider: providerId,
-        name: defaultModel,
-      },
-    ],
-  };
+    defaultModel,
+  });
 
   return {
     agent,
     async createSession(context: AgentSessionContext): Promise<AgentSession> {
       const runtime = options.runtime ?? createCursorSdkRuntime();
       const cwd = context.workingDirectory ? uriToPath(context.workingDirectory) : process.cwd();
-      const model = modelId(context.model, defaultModel);
+      const model = resolveModelId(context.model, defaultModel);
       const session = new CursorSdkAHPAgentSession({
         runtime,
         apiKey: options.apiKey ?? process.env.CURSOR_API_KEY,
@@ -92,13 +87,16 @@ interface CursorSdkAHPAgentSessionOptions {
 }
 
 class CursorSdkAHPAgentSession implements AgentSession {
-  private activeClientTools: ActiveClientTools | undefined;
+  private readonly activeClientTools: ActiveClientToolRouter;
   private currentTurnId: string | undefined;
   private agent: CursorSdkAgent | undefined;
   private run: CursorSdkRun | undefined;
 
   constructor(private readonly options: CursorSdkAHPAgentSessionOptions) {
-    this.activeClientTools = options.activeClientTools;
+    this.activeClientTools = new ActiveClientToolRouter({
+      activeClientTools: options.activeClientTools,
+      sink: options.activeClientToolSink,
+    });
   }
 
   async start(): Promise<void> {
@@ -120,8 +118,7 @@ class CursorSdkAHPAgentSession implements AgentSession {
     }
 
     const ahpTurnId = turnId ?? `turn-${Date.now()}`;
-    const partId = `${ahpTurnId}:markdown`;
-    let partEmitted = false;
+    const markdown = new MarkdownTurnEmitter(sink, ahpTurnId);
     this.currentTurnId = ahpTurnId;
 
     try {
@@ -148,27 +145,14 @@ class CursorSdkAHPAgentSession implements AgentSession {
           if (signal.aborted) {
             return;
           }
-          partEmitted = emitCursorEvent(event, sink, ahpTurnId, partId, partEmitted);
+          emitCursorEvent(event, markdown);
         }
 
         const result = await run.wait();
-        if (!partEmitted && result.result) {
-          partEmitted = true;
-          sink.emit(markdownPart(ahpTurnId, partId));
-          sink.emit({
-            type: 'session/delta',
-            turnId: ahpTurnId,
-            partId,
-            content: result.result,
-          } as StateAction);
+        if (!markdown.partEmitted && result.result) {
+          markdown.emitDelta(result.result);
         }
-        if (!partEmitted) {
-          sink.emit(markdownPart(ahpTurnId, partId));
-        }
-        sink.emit({
-          type: 'session/turnComplete',
-          turnId: ahpTurnId,
-        } as StateAction);
+        markdown.complete();
       } finally {
         signal.removeEventListener('abort', abort);
       }
@@ -179,7 +163,7 @@ class CursorSdkAHPAgentSession implements AgentSession {
   }
 
   setActiveClientTools(activeClientTools: ActiveClientTools | undefined): void {
-    this.activeClientTools = activeClientTools;
+    this.activeClientTools.setActiveClientTools(activeClientTools);
   }
 
   async cancel(): Promise<void> {
@@ -203,7 +187,7 @@ class CursorSdkAHPAgentSession implements AgentSession {
   }
 
   private customTools(): CursorSdkCustomTools | undefined {
-    const tools = this.activeClientTools?.tools;
+    const tools = this.activeClientTools.tools;
     if (!tools?.length) {
       return undefined;
     }
@@ -222,12 +206,10 @@ class CursorSdkAHPAgentSession implements AgentSession {
             pastTenseMessage: `No active AHP turn is available for tool ${tool.name}`,
           });
         }
-        const result = await this.options.activeClientToolSink.reportInvocation({
+        const result = await this.activeClientTools.reportInvocation({
           turnId,
           toolCallId: context.toolCallId ?? `cursor-tool-${randomUUID()}`,
           toolName: tool.name,
-          displayName: tool.title ?? tool.name,
-          invocationMessage: tool.title ?? tool.name,
           toolInput: JSON.stringify(args ?? {}),
         });
         return cursorToolResult(result);
@@ -238,32 +220,18 @@ class CursorSdkAHPAgentSession implements AgentSession {
 
 function emitCursorEvent(
   event: CursorSdkMessage,
-  sink: AgentTurnSink,
-  turnId: string,
-  partId: string,
-  partEmitted: boolean,
-): boolean {
+  markdown: MarkdownTurnEmitter,
+): void {
   if (!isAssistantMessage(event)) {
-    return partEmitted;
+    return;
   }
 
-  let emitted = partEmitted;
   for (const block of event.message.content) {
     if (block.type !== 'text') {
       continue;
     }
-    if (!emitted) {
-      emitted = true;
-      sink.emit(markdownPart(turnId, partId));
-    }
-    sink.emit({
-      type: 'session/delta',
-      turnId,
-      partId,
-      content: block.text,
-    } as StateAction);
+    markdown.emitDelta(block.text);
   }
-  return emitted;
 }
 
 function isAssistantMessage(event: CursorSdkMessage): event is Extract<CursorSdkMessage, { readonly type: 'assistant' }> {
@@ -280,27 +248,4 @@ function cursorToolResult(result: ToolCallResult): CursorSdkCustomToolResult {
     content: [{ type: 'text', text: toolResultText(result) }],
     ...(result.structuredContent ? { structuredContent: result.structuredContent as Record<string, never> } : {}),
   };
-}
-
-function markdownPart(turnId: string, partId: string): StateAction {
-  return {
-    type: 'session/responsePart',
-    turnId,
-    part: {
-      kind: 'markdown',
-      id: partId,
-      content: '',
-    },
-  } as StateAction;
-}
-
-function modelId(model: ModelSelection | undefined, fallback: string): string {
-  return model?.id ?? fallback;
-}
-
-function uriToPath(uri: URI): string {
-  if (!uri.startsWith('file://')) {
-    return uri;
-  }
-  return fileURLToPath(uri);
 }
