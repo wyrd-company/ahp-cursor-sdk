@@ -3,7 +3,6 @@ import { after, test } from 'node:test';
 
 import type { Message, StateAction, ToolDefinition } from '@microsoft/agent-host-protocol';
 import { AhpClient } from '@microsoft/agent-host-protocol/client';
-import type { AhpTransport, JsonRpcMessage, TransportFrame } from '@microsoft/agent-host-protocol/client';
 import {
   AhpServer,
   createInMemoryTransportPair,
@@ -258,7 +257,7 @@ class FakeCursorRun implements CursorSdkRun {
 function createClient(server: AhpServer): AhpClient {
   const [clientTransport, serverTransport] = createInMemoryTransportPair();
   runningServers.push(server.accept(serverTransport));
-  return new AhpClient(asAhpTransport(clientTransport), { requestTimeoutMs: 1_000 });
+  return new AhpClient(clientTransport, { requestTimeoutMs: 1_000 });
 }
 
 function assistantMessage(text: string): CursorSdkMessage {
@@ -317,29 +316,4 @@ function toolResultText(result: CursorSdkCustomToolResult): string {
       .join('\n');
   }
   return JSON.stringify(result);
-}
-
-function asAhpTransport(transport: {
-  send(message: unknown): Promise<void> | void;
-  recv(): Promise<unknown>;
-  close(): Promise<void> | void;
-}): AhpTransport {
-  return {
-    send(message: JsonRpcMessage | string): Promise<void> | void {
-      return transport.send(message);
-    },
-    async recv(): Promise<TransportFrame | null> {
-      const message = await transport.recv();
-      if (message === null) {
-        return null;
-      }
-      if (typeof message === 'string') {
-        return { kind: 'text', text: message };
-      }
-      return { kind: 'parsed', message: message as never };
-    },
-    close(): Promise<void> | void {
-      return transport.close();
-    },
-  };
 }

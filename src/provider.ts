@@ -18,7 +18,7 @@ import {
   type AgentSession,
   type AgentSessionContext,
   type AgentTurnSink,
-} from '@wyrd-company/ahp-server';
+} from '@wyrd-company/ahp-provider-kit';
 
 import { createCursorSdkRuntime } from './runtime.js';
 import {

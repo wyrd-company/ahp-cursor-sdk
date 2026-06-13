@@ -10,7 +10,7 @@
     "url": "git+https://github.com/wyrd-company/ahp-cursor-sdk.git"
   },
   "files": [
-    "dist",
+    "dist/src",
     "README.md",
     "LICENSE"
   ],
@@ -25,6 +25,8 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "clean": "rm -rf dist",
+    "prepack": "npm run clean && npm run build",
+    "prepublishOnly": "npm run verify",
     "test": "node --test --import tsx test/*.test.ts",
     "test:live": "scripts/validate-live-cursor-sdk.sh",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -32,15 +34,19 @@
   },
   "dependencies": {
     "@cursor/sdk": "^1.0.18",
-    "@microsoft/agent-host-protocol": "^0.3.0"
+    "@microsoft/agent-host-protocol": "^0.3.0",
+    "@wyrd-company/ahp-provider-kit": "^0.1.0"
   },
   "peerDependencies": {
     "@wyrd-company/ahp-server": "^0.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "@wyrd-company/ahp-server": "file:../ahp-server",
+    "@wyrd-company/ahp-server": "^0.1.0",
     "tsx": "^4.19.0",
     "typescript": "^5.7.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

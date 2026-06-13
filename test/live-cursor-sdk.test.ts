@@ -3,7 +3,6 @@ import { test } from 'node:test';
 
 import type { Message, StateAction } from '@microsoft/agent-host-protocol';
 import { AhpClient } from '@microsoft/agent-host-protocol/client';
-import type { AhpTransport, JsonRpcMessage, TransportFrame } from '@microsoft/agent-host-protocol/client';
 import {
   AhpServer,
   createInMemoryTransportPair,
@@ -25,7 +24,7 @@ test('streams a live Cursor SDK local turn through AHP', {
   const [clientTransport, serverTransport] = createInMemoryTransportPair();
   const serving = server.accept(serverTransport);
 
-  const client = new AhpClient(asAhpTransport(clientTransport), { requestTimeoutMs: 5_000 });
+  const client = new AhpClient(clientTransport, { requestTimeoutMs: 5_000 });
   client.connect();
   await client.initialize({ clientId: 'cursor-live-client', protocolVersions: ['0.3.0'] });
 
@@ -73,29 +72,4 @@ async function nextAction(subscription: AsyncIterator<unknown>): Promise<{ actio
   assert.equal(value.type, 'action');
   assert.ok(value.params?.action);
   return { action: value.params.action };
-}
-
-function asAhpTransport(transport: {
-  send(message: unknown): Promise<void> | void;
-  recv(): Promise<unknown>;
-  close(): Promise<void> | void;
-}): AhpTransport {
-  return {
-    send(message: JsonRpcMessage | string): Promise<void> | void {
-      return transport.send(message);
-    },
-    async recv(): Promise<TransportFrame | null> {
-      const message = await transport.recv();
-      if (message === null) {
-        return null;
-      }
-      if (typeof message === 'string') {
-        return { kind: 'text', text: message };
-      }
-      return { kind: 'parsed', message: message as never };
-    },
-    close(): Promise<void> | void {
-      return transport.close();
-    },
-  };
 }
