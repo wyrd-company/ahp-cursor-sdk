@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { after, test } from 'node:test';
 
 import type { Message, StateAction, ToolDefinition } from '@microsoft/agent-host-protocol';
 import { AhpClient } from '@microsoft/agent-host-protocol/client';
 import {
   AhpServer,
+  FileSystemSessionStore,
   createInMemoryTransportPair,
 } from '@wyrd-company/ahp-server';
 
@@ -176,6 +180,67 @@ test('Cursor SDK provider routes active-client tools through local customTools',
 
   await owner.shutdown();
   await other.shutdown();
+});
+
+test('Cursor SDK provider resumes a persisted AHP session by recreating its local agent', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-cursor-resume-'));
+  const firstRuntime = new FakeCursorRuntime();
+  const secondRuntime = new FakeCursorRuntime();
+  const sessionUri = 'ahp-session:/cursor-resume';
+
+  try {
+    const firstServer = new AhpServer({
+      providers: [createCursorSdkProvider({ runtime: firstRuntime, apiKey: 'cursor-test-key', defaultModel: 'composer-test' })],
+      store: new FileSystemSessionStore({ directory }),
+    });
+    const firstClient = createClient(firstServer);
+    firstClient.connect();
+    await firstClient.initialize({ clientId: 'cursor-client', protocolVersions: ['0.3.0'] });
+    await firstClient.request('createSession', {
+      channel: sessionUri,
+      provider: 'cursor-sdk',
+      workingDirectory: 'file:///workspaces/project-a',
+      model: { id: 'composer-test' },
+    });
+    await firstClient.shutdown();
+
+    const secondServer = new AhpServer({
+      providers: [createCursorSdkProvider({ runtime: secondRuntime, apiKey: 'cursor-test-key', defaultModel: 'composer-test' })],
+      store: new FileSystemSessionStore({ directory }),
+    });
+    const secondClient = createClient(secondServer);
+    secondClient.connect();
+
+    const reconnect = await secondClient.reconnect({
+      clientId: 'cursor-client',
+      lastSeenServerSeq: 0,
+      subscriptions: [sessionUri],
+    });
+    assert.equal(reconnect.type, 'snapshot');
+    assert.equal(secondRuntime.agents[0]?.createOptions.local.cwd, '/workspaces/project-a');
+
+    const subscription = secondClient.attachSubscription(sessionUri);
+    secondClient.dispatch(sessionUri, {
+      type: 'session/turnStarted',
+      turnId: 'resume-turn',
+      message: userMessage('Continue after reconnect'),
+    } as StateAction);
+
+    const events = [
+      await nextAction(subscription),
+      await nextAction(subscription),
+      await nextAction(subscription),
+      await nextAction(subscription),
+    ].map(item => item.action);
+
+    assert.equal(secondRuntime.agents[0]?.messages[0], 'Continue after reconnect');
+    assert.equal(secondRuntime.agents[0]?.sendOptions[0]?.model?.id, 'composer-test');
+    assert.equal(events.at(-1)?.type, 'session/turnComplete');
+
+    await secondClient.shutdown();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 });
 
 interface FakeCursorRuntimeOptions {

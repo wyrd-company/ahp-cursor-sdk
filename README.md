@@ -32,6 +32,16 @@ The provider maps AHP active-client tools to Cursor local `customTools`.
 - AHP owns session URI, turn id, tool call id, tool name, and active-client identity. Tool input is passed through as display/input data only.
 - Only the active client that owns the tool call can complete it through normal AHP `session/toolCallComplete`.
 
+## Session Resume
+
+The provider implements `ResumableAgentProvider`. When `ahp-server` reloads a
+persisted AHP session, the adapter recreates the local Cursor SDK agent using the
+stored AHP working directory, model, config, and active-client tools. New turns
+after AHP reconnect run through that reconstructed local agent.
+
+The current adapter does not persist Cursor SDK private run state. This restores
+the runtime needed for future turns; it does not resume an interrupted Cursor run.
+
 ## Usage
 
 ```ts

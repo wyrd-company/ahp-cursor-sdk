@@ -18,6 +18,8 @@ import {
   type AgentSession,
   type AgentSessionContext,
   type AgentTurnSink,
+  type ResumableAgentProvider,
+  type ResumableAgentSessionContext,
 } from '@wyrd-company/ahp-provider-kit';
 
 import { createCursorSdkRuntime } from './runtime.js';
@@ -43,7 +45,7 @@ export interface CursorSdkProviderOptions {
   readonly localForce?: boolean;
 }
 
-export function createCursorSdkProvider(options: CursorSdkProviderOptions = {}): AgentProvider {
+export function createCursorSdkProvider(options: CursorSdkProviderOptions = {}): ResumableAgentProvider {
   const providerId = options.providerId ?? 'cursor-sdk';
   const defaultModel = options.defaultModel ?? 'composer-2';
   const agent: AgentInfo = singleModelAgentInfo({
@@ -53,24 +55,31 @@ export function createCursorSdkProvider(options: CursorSdkProviderOptions = {}):
     defaultModel,
   });
 
+  async function createRuntimeSession(context: AgentSessionContext): Promise<AgentSession> {
+    const runtime = options.runtime ?? createCursorSdkRuntime();
+    const cwd = context.workingDirectory ? uriToPath(context.workingDirectory) : process.cwd();
+    const model = resolveModelId(context.model, defaultModel);
+    const session = new CursorSdkAHPAgentSession({
+      runtime,
+      apiKey: options.apiKey ?? process.env.CURSOR_API_KEY,
+      agentName: options.agentName ?? 'AHP Cursor SDK',
+      cwd,
+      model,
+      localForce: options.localForce,
+      activeClientTools: context.activeClientTools,
+      activeClientToolSink: context.activeClientToolSink,
+    });
+    await session.start();
+    return session;
+  }
+
   return {
     agent,
-    async createSession(context: AgentSessionContext): Promise<AgentSession> {
-      const runtime = options.runtime ?? createCursorSdkRuntime();
-      const cwd = context.workingDirectory ? uriToPath(context.workingDirectory) : process.cwd();
-      const model = resolveModelId(context.model, defaultModel);
-      const session = new CursorSdkAHPAgentSession({
-        runtime,
-        apiKey: options.apiKey ?? process.env.CURSOR_API_KEY,
-        agentName: options.agentName ?? 'AHP Cursor SDK',
-        cwd,
-        model,
-        localForce: options.localForce,
-        activeClientTools: context.activeClientTools,
-        activeClientToolSink: context.activeClientToolSink,
-      });
-      await session.start();
-      return session;
+    createSession(context: AgentSessionContext): Promise<AgentSession> {
+      return createRuntimeSession(context);
+    },
+    resumeSession(context: ResumableAgentSessionContext): Promise<AgentSession> {
+      return createRuntimeSession(context);
     },
   };
 }
