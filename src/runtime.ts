@@ -7,5 +7,8 @@ export function createCursorSdkRuntime(): CursorSdkRuntime {
     createAgent(options: CursorSdkCreateAgentOptions) {
       return Agent.create(options as never);
     },
+    resumeAgent(agentId: string, options: CursorSdkCreateAgentOptions) {
+      return Agent.resume(agentId, options as never);
+    },
   };
 }

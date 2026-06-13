@@ -7,6 +7,7 @@ import type {
 
 export interface CursorSdkRuntime {
   createAgent(options: CursorSdkCreateAgentOptions): Promise<CursorSdkAgent> | CursorSdkAgent;
+  resumeAgent?(agentId: string, options: CursorSdkCreateAgentOptions): Promise<CursorSdkAgent> | CursorSdkAgent;
 }
 
 export interface CursorSdkCreateAgentOptions {

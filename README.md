@@ -35,12 +35,14 @@ The provider maps AHP active-client tools to Cursor local `customTools`.
 ## Session Resume
 
 The provider implements `ResumableAgentProvider`. When `ahp-server` reloads a
-persisted AHP session, the adapter recreates the local Cursor SDK agent using the
-stored AHP working directory, model, config, and active-client tools. New turns
-after AHP reconnect run through that reconstructed local agent.
+persisted AHP session, the adapter recreates the local Cursor SDK agent runtime
+from the stored AHP working directory, model, config, and active-client tools.
+After Cursor returns an `agentId`, the adapter stores it through
+`AgentSession.getResumeState()` and calls Cursor SDK `Agent.resume(agentId, ...)`
+after an AHP server restart.
 
-The current adapter does not persist Cursor SDK private run state. This restores
-the runtime needed for future turns; it does not resume an interrupted Cursor run.
+This preserves the Cursor local agent identity for future turns. The adapter
+does not attempt to replay or continue a half-streamed Cursor run.
 
 ## Usage
 

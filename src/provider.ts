@@ -18,6 +18,7 @@ import {
   type AgentSession,
   type AgentSessionContext,
   type AgentTurnSink,
+  type ProviderResumeState,
   type ResumableAgentProvider,
   type ResumableAgentSessionContext,
 } from '@wyrd-company/ahp-provider-kit';
@@ -55,19 +56,21 @@ export function createCursorSdkProvider(options: CursorSdkProviderOptions = {}):
     defaultModel,
   });
 
-  async function createRuntimeSession(context: AgentSessionContext): Promise<AgentSession> {
+  async function createRuntimeSession(context: AgentSessionContext | ResumableAgentSessionContext): Promise<AgentSession> {
     const runtime = options.runtime ?? createCursorSdkRuntime();
     const cwd = context.workingDirectory ? uriToPath(context.workingDirectory) : process.cwd();
     const model = resolveModelId(context.model, defaultModel);
+    const resumeState = resumeStateFromContext(context);
     const session = new CursorSdkAHPAgentSession({
       runtime,
       apiKey: options.apiKey ?? process.env.CURSOR_API_KEY,
       agentName: options.agentName ?? 'AHP Cursor SDK',
       cwd,
-      model,
+      model: resumeState.model ?? model,
       localForce: options.localForce,
       activeClientTools: context.activeClientTools,
       activeClientToolSink: context.activeClientToolSink,
+      agentId: resumeState.agentId,
     });
     await session.start();
     return session;
@@ -84,6 +87,11 @@ export function createCursorSdkProvider(options: CursorSdkProviderOptions = {}):
   };
 }
 
+interface CursorSdkResumeState extends ProviderResumeState {
+  readonly agentId?: string;
+  readonly model?: string;
+}
+
 interface CursorSdkAHPAgentSessionOptions {
   readonly runtime: CursorSdkRuntime;
   readonly apiKey?: string;
@@ -93,6 +101,7 @@ interface CursorSdkAHPAgentSessionOptions {
   readonly localForce?: boolean;
   readonly activeClientTools?: ActiveClientTools;
   readonly activeClientToolSink: ActiveClientToolSink;
+  readonly agentId?: string;
 }
 
 class CursorSdkAHPAgentSession implements AgentSession {
@@ -109,7 +118,7 @@ class CursorSdkAHPAgentSession implements AgentSession {
   }
 
   async start(): Promise<void> {
-    this.agent = await this.options.runtime.createAgent({
+    const createOptions = {
       apiKey: this.options.apiKey,
       name: this.options.agentName,
       model: { id: this.options.model },
@@ -117,7 +126,15 @@ class CursorSdkAHPAgentSession implements AgentSession {
         cwd: this.options.cwd,
         customTools: this.customTools(),
       },
-    });
+    };
+    if (this.options.agentId) {
+      if (!this.options.runtime.resumeAgent) {
+        throw new Error('Cursor SDK runtime does not support Agent.resume');
+      }
+      this.agent = await this.options.runtime.resumeAgent(this.options.agentId, createOptions);
+      return;
+    }
+    this.agent = await this.options.runtime.createAgent(createOptions);
   }
 
   async sendUserMessage(message: Message, sink: AgentTurnSink, signal: AbortSignal, turnId?: string): Promise<void> {
@@ -175,6 +192,13 @@ class CursorSdkAHPAgentSession implements AgentSession {
     this.activeClientTools.setActiveClientTools(activeClientTools);
   }
 
+  getResumeState(): CursorSdkResumeState | undefined {
+    const agentId = this.agent?.agentId ?? this.options.agentId;
+    return agentId
+      ? { agentId, model: this.options.model }
+      : undefined;
+  }
+
   async cancel(): Promise<void> {
     const run = this.run;
     if (!run) {
@@ -225,6 +249,16 @@ class CursorSdkAHPAgentSession implements AgentSession {
       },
     };
   }
+}
+
+function resumeStateFromContext(context: AgentSessionContext | ResumableAgentSessionContext): CursorSdkResumeState {
+  if (!('resumeState' in context) || !context.resumeState) {
+    return {};
+  }
+  return {
+    ...(typeof context.resumeState.agentId === 'string' ? { agentId: context.resumeState.agentId } : {}),
+    ...(typeof context.resumeState.model === 'string' ? { model: context.resumeState.model } : {}),
+  };
 }
 
 function emitCursorEvent(

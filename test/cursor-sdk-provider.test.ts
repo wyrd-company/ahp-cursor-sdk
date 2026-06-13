@@ -204,9 +204,15 @@ test('Cursor SDK provider resumes a persisted AHP session by recreating its loca
     });
     await firstClient.shutdown();
 
+    const store = new FileSystemSessionStore({ directory });
+    assert.deepEqual(store.getSession(sessionUri)?.providerResumeState, {
+      agentId: 'cursor-agent-1',
+      model: 'composer-test',
+    });
+
     const secondServer = new AhpServer({
       providers: [createCursorSdkProvider({ runtime: secondRuntime, apiKey: 'cursor-test-key', defaultModel: 'composer-test' })],
-      store: new FileSystemSessionStore({ directory }),
+      store,
     });
     const secondClient = createClient(secondServer);
     secondClient.connect();
@@ -217,6 +223,7 @@ test('Cursor SDK provider resumes a persisted AHP session by recreating its loca
       subscriptions: [sessionUri],
     });
     assert.equal(reconnect.type, 'snapshot');
+    assert.deepEqual(secondRuntime.resumedAgentIds, ['cursor-agent-1']);
     assert.equal(secondRuntime.agents[0]?.createOptions.local.cwd, '/workspaces/project-a');
 
     const subscription = secondClient.attachSubscription(sessionUri);
@@ -253,11 +260,19 @@ interface FakeCursorRuntimeOptions {
 
 class FakeCursorRuntime implements CursorSdkRuntime {
   readonly agents: FakeCursorAgent[] = [];
+  readonly resumedAgentIds: string[] = [];
 
   constructor(private readonly options: FakeCursorRuntimeOptions = {}) {}
 
   createAgent(options: CursorSdkCreateAgentOptions): CursorSdkAgent {
-    const agent = new FakeCursorAgent(options, this.options);
+    const agent = new FakeCursorAgent(`cursor-agent-${this.agents.length + 1}`, options, this.options);
+    this.agents.push(agent);
+    return agent;
+  }
+
+  resumeAgent(agentId: string, options: CursorSdkCreateAgentOptions): CursorSdkAgent {
+    this.resumedAgentIds.push(agentId);
+    const agent = new FakeCursorAgent(agentId, options, this.options);
     this.agents.push(agent);
     return agent;
   }
@@ -270,6 +285,7 @@ class FakeCursorAgent implements CursorSdkAgent {
   disposed = false;
 
   constructor(
+    readonly agentId: string,
     readonly createOptions: CursorSdkCreateAgentOptions,
     private readonly runtimeOptions: FakeCursorRuntimeOptions,
   ) {}
