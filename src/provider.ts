@@ -3,8 +3,10 @@ import { randomUUID } from 'node:crypto';
 import type {
   AgentInfo,
   Message,
+  StateAction,
   ToolCallResult,
   ToolDefinition,
+  UsageInfo,
 } from '@microsoft/agent-host-protocol';
 import {
   ActiveClientToolRouter,
@@ -30,10 +32,15 @@ import {
   type CursorSdkAgent,
   type CursorSdkCustomToolResult,
   type CursorSdkCustomTools,
+  type CursorSdkConversationTurn,
   type CursorSdkMessage,
   type CursorSdkRun,
   type CursorSdkRuntime,
+  type CursorSdkUsage,
 } from './types.js';
+
+const CURSOR_COMPOSER_2_5_MODEL = 'composer-2.5';
+const CURSOR_COMPOSER_2_5_CONTEXT_WINDOW = 200_000;
 
 export interface CursorSdkProviderOptions {
   readonly apiKey?: string;
@@ -48,7 +55,7 @@ export interface CursorSdkProviderOptions {
 
 export function createCursorSdkProvider(options: CursorSdkProviderOptions = {}): ResumableAgentProvider {
   const providerId = options.providerId ?? 'cursor-sdk';
-  const defaultModel = options.defaultModel ?? 'composer-2';
+  const defaultModel = options.defaultModel ?? CURSOR_COMPOSER_2_5_MODEL;
   const agent: AgentInfo = singleModelAgentInfo({
     providerId,
     displayName: options.displayName ?? 'Cursor SDK',
@@ -167,10 +174,12 @@ class CursorSdkAHPAgentSession implements AgentSession {
       signal.addEventListener('abort', abort, { once: true });
 
       try {
+        let assistantText = '';
         for await (const event of run.stream()) {
           if (signal.aborted) {
             return;
           }
+          assistantText += cursorEventText(event);
           emitCursorEvent(event, markdown);
         }
 
@@ -178,6 +187,14 @@ class CursorSdkAHPAgentSession implements AgentSession {
         if (!markdown.partEmitted && result.result) {
           markdown.emitDelta(result.result);
         }
+        const usage = await usageInfo({
+          run,
+          result,
+          model: this.options.model,
+          userText: message.text,
+          assistantText: result.result ?? assistantText,
+        });
+        sink.emit(usageAction(ahpTurnId, usage));
         markdown.complete();
       } finally {
         signal.removeEventListener('abort', abort);
@@ -275,6 +292,196 @@ function emitCursorEvent(
     }
     markdown.emitDelta(block.text);
   }
+}
+
+function usageAction(turnId: string, usage: UsageInfo): StateAction {
+  return {
+    type: 'session/usage',
+    turnId,
+    usage,
+  } as StateAction;
+}
+
+interface CursorUsageEstimateInput {
+  readonly run: CursorSdkRun;
+  readonly result?: { readonly usage?: CursorSdkUsage };
+  readonly model: string;
+  readonly userText: string;
+  readonly assistantText: string;
+}
+
+interface CursorUsageEstimate {
+  readonly text: string;
+  readonly source: 'conversation' | 'turn-transcript';
+  readonly conversationAvailable: boolean;
+  readonly failureReason?: string;
+}
+
+async function usageInfo(input: CursorUsageEstimateInput): Promise<UsageInfo> {
+  if (isCursorUsage(input.result?.usage)) {
+    return measuredUsageInfo(input.result.usage, input.model);
+  }
+
+  const estimate = await estimateText(input);
+  const inputTokens = estimateTokens(input.userText);
+  const outputTokens = estimateTokens(input.assistantText);
+  const totalTokens = estimateTokens(estimate.text);
+  const usageRatio = totalTokens / CURSOR_COMPOSER_2_5_CONTEXT_WINDOW;
+
+  return {
+    inputTokens,
+    outputTokens,
+    model: input.model,
+    _meta: {
+      wyrdContextUsage: {
+        totalTokens,
+        maxContextWindow: CURSOR_COMPOSER_2_5_CONTEXT_WINDOW,
+        usageRatio,
+        confidence: 'estimated',
+        source: 'estimated-transcript',
+      },
+      cursorContextUsageEstimate: {
+        model: CURSOR_COMPOSER_2_5_MODEL,
+        method: 'characters-divided-by-four-rounded-up',
+        transcriptSource: estimate.source,
+        conversationAvailable: estimate.conversationAvailable,
+        characterCount: estimate.text.length,
+        ...(estimate.failureReason ? { failureReason: estimate.failureReason } : {}),
+      },
+    },
+  };
+}
+
+function measuredUsageInfo(usage: CursorSdkUsage, model: string): UsageInfo {
+  const totalTokens = usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
+  const usageRatio = totalTokens / CURSOR_COMPOSER_2_5_CONTEXT_WINDOW;
+
+  return {
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    model,
+    cacheReadTokens: usage.cacheReadTokens,
+    _meta: {
+      wyrdContextUsage: {
+        totalTokens,
+        maxContextWindow: CURSOR_COMPOSER_2_5_CONTEXT_WINDOW,
+        usageRatio,
+        confidence: 'measured',
+        source: 'provider-api',
+        metric: 'lower-bound-context-tokens',
+      },
+      cursorUsage: usage,
+    },
+  };
+}
+
+async function estimateText(input: CursorUsageEstimateInput): Promise<CursorUsageEstimate> {
+  if (!input.run.conversation || (input.run.supports && !input.run.supports('conversation'))) {
+    return {
+      text: turnTranscriptText(input.userText, input.assistantText),
+      source: 'turn-transcript',
+      conversationAvailable: false,
+      failureReason: input.run.unsupportedReason?.('conversation') ?? 'Cursor SDK run does not expose conversation()',
+    };
+  }
+
+  try {
+    const conversation = await input.run.conversation();
+    const text = conversationText(conversation);
+    if (text) {
+      return {
+        text,
+        source: 'conversation',
+        conversationAvailable: true,
+      };
+    }
+    return {
+      text: turnTranscriptText(input.userText, input.assistantText),
+      source: 'turn-transcript',
+      conversationAvailable: true,
+      failureReason: 'Cursor SDK conversation() returned no text content',
+    };
+  } catch (error) {
+    return {
+      text: turnTranscriptText(input.userText, input.assistantText),
+      source: 'turn-transcript',
+      conversationAvailable: true,
+      failureReason: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function turnTranscriptText(userText: string, assistantText: string): string {
+  return [
+    `user: ${userText}`,
+    `assistant: ${assistantText}`,
+  ].join('\n');
+}
+
+function conversationText(conversation: readonly CursorSdkConversationTurn[]): string {
+  return conversation
+    .map(turn => textFragments(turn).join('\n'))
+    .filter(Boolean)
+    .join('\n');
+}
+
+function textFragments(value: unknown, seen = new Set<unknown>()): string[] {
+  if (typeof value === 'string') {
+    return value ? [value] : [];
+  }
+  if (typeof value !== 'object' || value === null) {
+    return [];
+  }
+  if (seen.has(value)) {
+    return [];
+  }
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    return value.flatMap(item => textFragments(item, seen));
+  }
+
+  const record = value as Record<string, unknown>;
+  return Object.entries(record).flatMap(([key, item]) => {
+    if (key === 'type' || key.endsWith('DurationMs')) {
+      return [];
+    }
+    return textFragments(item, seen);
+  });
+}
+
+function estimateTokens(text: string): number {
+  if (!text) {
+    return 0;
+  }
+  return Math.ceil(text.length / 4);
+}
+
+function isCursorUsage(value: unknown): value is CursorSdkUsage {
+  return isRecord(value) &&
+    finiteNumber(value.inputTokens) !== undefined &&
+    finiteNumber(value.outputTokens) !== undefined &&
+    finiteNumber(value.cacheReadTokens) !== undefined &&
+    finiteNumber(value.cacheWriteTokens) !== undefined;
+}
+
+function finiteNumber(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+}
+
+function cursorEventText(event: CursorSdkMessage): string {
+  if (!isAssistantMessage(event)) {
+    return '';
+  }
+
+  return event.message.content
+    .filter(block => block.type === 'text')
+    .map(block => block.text)
+    .join('');
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function isAssistantMessage(event: CursorSdkMessage): event is Extract<CursorSdkMessage, { readonly type: 'assistant' }> {

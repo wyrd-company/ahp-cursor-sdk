@@ -46,6 +46,7 @@ export interface CursorSdkRun {
   supports?(operation: string): boolean;
   unsupportedReason?(operation: string): string | undefined;
   stream(): AsyncIterable<CursorSdkMessage>;
+  conversation?(): Promise<readonly CursorSdkConversationTurn[]>;
   wait(): Promise<CursorSdkRunResult>;
   cancel?(): Promise<void>;
 }
@@ -54,6 +55,16 @@ export interface CursorSdkRunResult {
   readonly status: string;
   readonly result?: string;
   readonly durationMs?: number;
+  readonly usage?: CursorSdkUsage;
+}
+
+export type CursorSdkConversationTurn = Record<string, unknown>;
+
+export interface CursorSdkUsage {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cacheReadTokens: number;
+  readonly cacheWriteTokens: number;
 }
 
 export type CursorSdkMessage =

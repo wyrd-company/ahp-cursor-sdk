@@ -31,7 +31,7 @@ after(async () => {
 
 test('Cursor SDK provider streams a local run through AHP', async () => {
   const runtime = new FakeCursorRuntime();
-  const provider = createCursorSdkProvider({ runtime, apiKey: 'cursor-test-key', defaultModel: 'composer-test' });
+  const provider = createCursorSdkProvider({ runtime, apiKey: 'cursor-test-key' });
   const server = new AhpServer({ providers: [provider] });
   const client = createClient(server);
 
@@ -57,17 +57,27 @@ test('Cursor SDK provider streams a local run through AHP', async () => {
     await nextAction(subscription),
     await nextAction(subscription),
     await nextAction(subscription),
+    await nextAction(subscription),
   ].map(item => item.action);
 
   assert.equal(runtime.agents[0]?.createOptions.apiKey, 'cursor-test-key');
   assert.equal(runtime.agents[0]?.createOptions.local.cwd, '/workspaces/project-a');
   assert.equal(runtime.agents[0]?.messages[0], 'summarize');
-  assert.equal(runtime.agents[0]?.sendOptions[0]?.model?.id, 'composer-test');
+  assert.equal(runtime.agents[0]?.sendOptions[0]?.model?.id, 'composer-2.5');
   assert.equal(events[0]?.type, 'session/turnStarted');
   assert.equal(events[1]?.type, 'session/responsePart');
   assert.equal(events[2]?.type, 'session/delta');
   assert.equal((events[2] as { content?: string }).content, 'Cursor says hello');
-  assert.equal(events[3]?.type, 'session/turnComplete');
+  assert.equal(events[3]?.type, 'session/usage');
+  assert.deepEqual((events[3] as { usage?: unknown }).usage, cursorMeasuredUsage({
+    inputTokens: 8_564,
+    outputTokens: 41,
+    cacheReadTokens: 5_523,
+    cacheWriteTokens: 12,
+    totalTokens: 14_099,
+    usageRatio: 0.070495,
+  }));
+  assert.equal(events[4]?.type, 'session/turnComplete');
 
   await client.shutdown();
 });
@@ -169,6 +179,19 @@ test('Cursor SDK provider routes active-client tools through local customTools',
   const delta = await nextAction(subscription);
   assert.equal(delta.action.type, 'session/delta');
   assert.equal((delta.action as { content?: string }).content, 'Cursor tool result: found needle');
+  const usage = await nextAction(subscription);
+  assert.equal(usage.action.type, 'session/usage');
+  assert.deepEqual((usage.action as { usage?: unknown }).usage, cursorEstimatedUsage({
+    model: 'composer-test',
+    inputTokens: 3,
+    outputTokens: 8,
+    totalTokens: 16,
+    usageRatio: 0.00008,
+    characterCount: 62,
+    transcriptSource: 'turn-transcript',
+    conversationAvailable: false,
+    failureReason: 'Cursor SDK run does not expose conversation()',
+  }));
   const turnComplete = await nextAction(subscription);
   assert.equal(turnComplete.action.type, 'session/turnComplete');
 
@@ -234,6 +257,7 @@ test('Cursor SDK provider resumes a persisted AHP session by recreating its loca
     } as StateAction);
 
     const events = [
+      await nextAction(subscription),
       await nextAction(subscription),
       await nextAction(subscription),
       await nextAction(subscription),
@@ -313,7 +337,7 @@ class FakeCursorRun implements CursorSdkRun {
   ) {}
 
   supports(operation: string): boolean {
-    return operation === 'cancel';
+    return operation === 'cancel' || (!this.runtimeOptions.toolCall && operation === 'conversation');
   }
 
   async *stream(): AsyncIterable<CursorSdkMessage> {
@@ -328,8 +352,34 @@ class FakeCursorRun implements CursorSdkRun {
     yield assistantMessage('Cursor says hello');
   }
 
-  async wait(): Promise<{ status: string }> {
-    return { status: 'finished' };
+  async wait(): Promise<{
+    status: string;
+    usage?: {
+      inputTokens: number;
+      outputTokens: number;
+      cacheReadTokens: number;
+      cacheWriteTokens: number;
+    };
+  }> {
+    if (this.runtimeOptions.toolCall) {
+      return { status: 'finished' };
+    }
+    return {
+      status: 'finished',
+      usage: {
+        inputTokens: 8_564,
+        outputTokens: 41,
+        cacheReadTokens: 5_523,
+        cacheWriteTokens: 12,
+      },
+    };
+  }
+
+  async conversation(): Promise<readonly Record<string, unknown>[]> {
+    return [
+      { type: 'user', message: { text: 'summarize' } },
+      { type: 'assistantMessage', message: { text: 'Cursor says hello' } },
+    ];
   }
 
   async cancel(): Promise<void> {}
@@ -380,6 +430,77 @@ async function nextAction(subscription: AsyncIterator<unknown>): Promise<{ actio
   return {
     action: value.params.action,
     origin: value.params.origin,
+  };
+}
+
+interface ExpectedCursorUsageOptions {
+  readonly model?: string;
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly totalTokens: number;
+  readonly usageRatio: number;
+  readonly characterCount: number;
+  readonly transcriptSource: 'conversation' | 'turn-transcript';
+  readonly conversationAvailable: boolean;
+  readonly failureReason?: string;
+}
+
+interface ExpectedCursorMeasuredUsageOptions {
+  readonly inputTokens: number;
+  readonly outputTokens: number;
+  readonly cacheReadTokens: number;
+  readonly cacheWriteTokens: number;
+  readonly totalTokens: number;
+  readonly usageRatio: number;
+}
+
+function cursorMeasuredUsage(options: ExpectedCursorMeasuredUsageOptions) {
+  return {
+    model: 'composer-2.5',
+    inputTokens: options.inputTokens,
+    outputTokens: options.outputTokens,
+    cacheReadTokens: options.cacheReadTokens,
+    _meta: {
+      wyrdContextUsage: {
+        totalTokens: options.totalTokens,
+        maxContextWindow: 200_000,
+        usageRatio: options.usageRatio,
+        confidence: 'measured',
+        source: 'provider-api',
+        metric: 'lower-bound-context-tokens',
+      },
+      cursorUsage: {
+        inputTokens: options.inputTokens,
+        outputTokens: options.outputTokens,
+        cacheReadTokens: options.cacheReadTokens,
+        cacheWriteTokens: options.cacheWriteTokens,
+      },
+    },
+  };
+}
+
+function cursorEstimatedUsage(options: ExpectedCursorUsageOptions) {
+  return {
+    model: options.model ?? 'composer-2.5',
+    inputTokens: options.inputTokens,
+    outputTokens: options.outputTokens,
+    _meta: {
+      wyrdContextUsage: {
+        totalTokens: options.totalTokens,
+        maxContextWindow: 200_000,
+        usageRatio: options.usageRatio,
+        confidence: 'estimated',
+        source: 'estimated-transcript',
+      },
+      cursorContextUsageEstimate: {
+        model: 'composer-2.5',
+        method: 'characters-divided-by-four-rounded-up',
+        transcriptSource: options.transcriptSource,
+        conversationAvailable: options.conversationAvailable,
+        characterCount: options.characterCount,
+        ...(options.failureReason ? { failureReason: options.failureReason } : {}),
+      },
+    },
   };
 }
 

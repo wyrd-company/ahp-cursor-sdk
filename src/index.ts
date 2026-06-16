@@ -7,6 +7,7 @@ export type {
   CursorSdkAgent,
   CursorSdkAssistantMessage,
   CursorSdkContentBlock,
+  CursorSdkConversationTurn,
   CursorSdkCreateAgentOptions,
   CursorSdkCustomTool,
   CursorSdkCustomToolContent,
@@ -23,5 +24,6 @@ export type {
   CursorSdkTaskMessage,
   CursorSdkThinkingMessage,
   CursorSdkToolCallMessage,
+  CursorSdkUsage,
   CursorSdkUserMessage,
 } from './types.js';
