@@ -8,13 +8,16 @@ This package is intentionally separate from `@wyrd-company/ahp-server` because `
 
 ## Current Status
 
-Implementation is on hold pending an upstream Cursor SDK issue. The adapter requests local agents with `Agent.create({ apiKey, local: { cwd, store, customTools } })`, but Cursor SDK local agent creation currently fails for free users because local model validation calls a cloud models endpoint and returns `plan_required`.
+Cursor's cloud model listing endpoint can return `plan_required` for free accounts. This adapter does not need to call that endpoint: hosts can advertise an explicit local model list through provider options or a YAML file.
+
+The adapter still requests local agents with `Agent.create({ apiKey, local: { cwd, store, customTools } })`. If Cursor SDK itself validates a selected model through the cloud endpoint during local agent creation, that remains an upstream Cursor SDK issue.
 
 Reference: https://forum.cursor.com/t/agent-create-local-apikey-model-fails-for-free-users-because-local-model-validation-calls-cloud-v1-models/160839/10
 
 ## Behavior
 
 - Creates one local Cursor SDK agent per AHP session.
+- Advertises configured models from `models`, `modelListFile`, or `CURSOR_MODEL_LIST_FILE`; otherwise advertises `composer-2.5`.
 - Uses the AHP session working directory as Cursor local `cwd`.
 - Optionally passes an injected Cursor SDK `LocalAgentStore` as local `store` on create and resume.
 - Sends each AHP user turn with `agent.send(...)`.
@@ -60,10 +63,42 @@ const server = new AhpServer({
       apiKey: process.env.CURSOR_API_KEY,
       defaultModel: process.env.CURSOR_MODEL ?? 'composer-2',
       store,
+      modelListFile: process.env.CURSOR_MODEL_LIST_FILE,
     }),
   ],
 });
 ```
+
+Model lists can also be supplied directly:
+
+```ts
+createCursorSdkProvider({
+  models: [
+    'composer-2.5',
+    {
+      id: 'composer-fast',
+      name: 'Composer Fast',
+      maxContextWindow: 120_000,
+    },
+  ],
+});
+```
+
+Or as YAML:
+
+```yaml
+defaultModel: composer-2.5
+models:
+  - composer-2.5
+  - id: composer-fast
+    name: Composer Fast
+    maxContextWindow: 120000
+    supportsVision: false
+    _meta:
+      source: local-file
+```
+
+When `defaultModel` is omitted, the first configured model becomes the default. If no model list is configured, the provider falls back to `composer-2.5`.
 
 ## Development
 

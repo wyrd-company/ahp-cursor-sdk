@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test } from 'node:test';
@@ -28,6 +28,113 @@ const runningServers: Array<Promise<void>> = [];
 
 after(async () => {
   await Promise.allSettled(runningServers);
+});
+
+test('Cursor SDK provider advertises configured models without calling Cursor', () => {
+  const provider = createCursorSdkProvider({
+    defaultModel: 'composer-test',
+    models: [
+      'composer-test',
+      {
+        id: 'composer-large',
+        name: 'Composer Large',
+        maxContextWindow: 300_000,
+        supportsVision: true,
+        _meta: { tier: 'pro' },
+      },
+    ],
+  });
+
+  assert.deepEqual(provider.agent.models, [
+    {
+      id: 'composer-test',
+      provider: 'cursor-sdk',
+      name: 'composer-test',
+    },
+    {
+      id: 'composer-large',
+      provider: 'cursor-sdk',
+      name: 'Composer Large',
+      maxContextWindow: 300_000,
+      supportsVision: true,
+      _meta: { tier: 'pro' },
+    },
+  ]);
+});
+
+test('Cursor SDK provider loads configured models from a YAML file', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-cursor-models-'));
+  const modelListFile = join(directory, 'models.yml');
+
+  try {
+    writeFileSync(modelListFile, [
+      'defaultModel: composer-2.5',
+      'models:',
+      '  - composer-2.5',
+      '  - id: composer-fast',
+      '    name: Composer Fast',
+      '    maxContextWindow: 120000',
+      '    supportsVision: false',
+      '    _meta:',
+      '      source: local-file',
+      '',
+    ].join('\n'));
+
+    const provider = createCursorSdkProvider({ modelListFile });
+
+    assert.deepEqual(provider.agent.models, [
+      {
+        id: 'composer-2.5',
+        provider: 'cursor-sdk',
+        name: 'composer-2.5',
+      },
+      {
+        id: 'composer-fast',
+        provider: 'cursor-sdk',
+        name: 'Composer Fast',
+        maxContextWindow: 120_000,
+        supportsVision: false,
+        _meta: { source: 'local-file' },
+      },
+    ]);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Cursor SDK provider uses the first configured model as the default model', async () => {
+  const runtime = new FakeCursorRuntime();
+  const provider = createCursorSdkProvider({
+    runtime,
+    models: ['composer-local-a', 'composer-local-b'],
+  });
+  const server = new AhpServer({ providers: [provider] });
+  const client = createClient(server);
+
+  client.connect();
+  await client.initialize({ clientId: 'cursor-client', protocolVersions: ['0.3.0'] });
+
+  const sessionUri = 'ahp-session:/cursor-configured-default-model';
+  await client.request('createSession', {
+    channel: sessionUri,
+    provider: 'cursor-sdk',
+  });
+  const { subscription } = await client.subscribe(sessionUri);
+
+  client.dispatch(sessionUri, {
+    type: 'session/turnStarted',
+    turnId: 'turn-1',
+    message: userMessage('summarize'),
+  } as StateAction);
+
+  for (let i = 0; i < 5; i++) {
+    await nextAction(subscription);
+  }
+
+  assert.equal(runtime.agents[0]?.createOptions.model?.id, 'composer-local-a');
+  assert.equal(runtime.agents[0]?.sendOptions[0]?.model?.id, 'composer-local-a');
+
+  await client.shutdown();
 });
 
 test('Cursor SDK provider streams a local run through AHP', async () => {

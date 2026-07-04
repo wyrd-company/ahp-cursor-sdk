@@ -1,6 +1,8 @@
 export { createCursorSdkProvider } from './provider.js';
 export { createCursorSdkRuntime } from './runtime.js';
 export type {
+  CursorSdkModelListItem,
+  CursorSdkModelListObject,
   CursorSdkProviderOptions,
 } from './provider.js';
 export type {

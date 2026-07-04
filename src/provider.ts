@@ -1,8 +1,10 @@
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 
 import type {
   AgentInfo,
   Message,
+  SessionModelInfo,
   StateAction,
   ToolCallResult,
   ToolDefinition,
@@ -12,7 +14,6 @@ import {
   ActiveClientToolRouter,
   MarkdownTurnEmitter,
   resolveModelId,
-  singleModelAgentInfo,
   uriToPath,
   type ActiveClientTools,
   type ActiveClientToolSink,
@@ -24,6 +25,7 @@ import {
   type ResumableAgentProvider,
   type ResumableAgentSessionContext,
 } from '@wyrd-company/ahp-provider-kit';
+import { parse as parseYaml } from 'yaml';
 
 import { createCursorSdkRuntime } from './runtime.js';
 import {
@@ -51,20 +53,40 @@ export interface CursorSdkProviderOptions {
   readonly displayName?: string;
   readonly description?: string;
   readonly defaultModel?: string;
+  readonly models?: readonly CursorSdkModelListItem[];
+  readonly modelListFile?: string;
   readonly agentName?: string;
   readonly store?: CursorSdkLocalAgentStore;
   readonly localForce?: boolean;
 }
 
+export type CursorSdkModelListItem =
+  | string
+  | CursorSdkModelListObject;
+
+export interface CursorSdkModelListObject {
+  readonly id: string;
+  readonly name?: string;
+  readonly maxContextWindow?: number;
+  readonly supportsVision?: boolean;
+  readonly policyState?: SessionModelInfo['policyState'];
+  readonly configSchema?: SessionModelInfo['configSchema'];
+  readonly _meta?: Record<string, unknown>;
+}
+
 export function createCursorSdkProvider(options: CursorSdkProviderOptions = {}): ResumableAgentProvider {
   const providerId = options.providerId ?? 'cursor-sdk';
-  const defaultModel = options.defaultModel ?? CURSOR_COMPOSER_2_5_MODEL;
-  const agent: AgentInfo = singleModelAgentInfo({
-    providerId,
+  const modelList = cursorSdkModelList({
+    ...options,
+    modelListFile: options.modelListFile ?? process.env.CURSOR_MODEL_LIST_FILE,
+  }, providerId);
+  const defaultModel = modelList.defaultModel;
+  const agent: AgentInfo = {
+    provider: providerId,
     displayName: options.displayName ?? 'Cursor SDK',
     description: options.description ?? 'Cursor SDK local agent adapter',
-    defaultModel,
-  });
+    models: modelList.models,
+  };
 
   async function createRuntimeSession(context: AgentSessionContext | ResumableAgentSessionContext): Promise<AgentSession> {
     const runtime = options.runtime ?? createCursorSdkRuntime();
@@ -95,6 +117,116 @@ export function createCursorSdkProvider(options: CursorSdkProviderOptions = {}):
     resumeSession(context: ResumableAgentSessionContext): Promise<AgentSession> {
       return createRuntimeSession(context);
     },
+  };
+}
+
+interface CursorSdkModelList {
+  readonly defaultModel: string;
+  readonly models: SessionModelInfo[];
+}
+
+function cursorSdkModelList(options: CursorSdkProviderOptions, providerId: string): CursorSdkModelList {
+  const fileConfig = !options.models && options.modelListFile
+    ? loadCursorSdkModelListFile(options.modelListFile)
+    : {};
+  const configuredModels = options.models ?? fileConfig.models;
+  const firstModelId = configuredModels?.[0] ? modelListItemId(configuredModels[0]) : undefined;
+  const defaultModel = options.defaultModel ?? fileConfig.defaultModel ?? firstModelId ?? CURSOR_COMPOSER_2_5_MODEL;
+  const models = configuredModels?.length
+    ? configuredModels.map(model => sessionModelInfo(model, providerId))
+    : [sessionModelInfo(defaultModel, providerId)];
+
+  if (models.some(model => model.id === defaultModel)) {
+    return { defaultModel, models };
+  }
+  return {
+    defaultModel,
+    models: [sessionModelInfo(defaultModel, providerId), ...models],
+  };
+}
+
+interface CursorSdkModelListFile {
+  readonly defaultModel?: string;
+  readonly models?: readonly CursorSdkModelListItem[];
+}
+
+function loadCursorSdkModelListFile(path: string): CursorSdkModelListFile {
+  const parsed = parseYaml(readFileSync(path, 'utf8')) as unknown;
+  const models = modelItemsFromParsedYaml(parsed);
+  const defaultModel = defaultModelFromParsedYaml(parsed);
+  return {
+    ...(defaultModel ? { defaultModel } : {}),
+    ...(models ? { models } : {}),
+  };
+}
+
+function modelItemsFromParsedYaml(parsed: unknown): readonly CursorSdkModelListItem[] | undefined {
+  if (Array.isArray(parsed)) {
+    return parsed.map(modelListItemFromParsedYaml);
+  }
+  if (isRecord(parsed)) {
+    const models = parsed.models;
+    if (models === undefined) {
+      return undefined;
+    }
+    if (!Array.isArray(models)) {
+      throw new Error('Cursor SDK model list file must define models as a YAML sequence');
+    }
+    return models.map(modelListItemFromParsedYaml);
+  }
+  if (parsed === null) {
+    return undefined;
+  }
+  throw new Error('Cursor SDK model list file must be a YAML sequence or mapping with a models sequence');
+}
+
+function defaultModelFromParsedYaml(parsed: unknown): string | undefined {
+  if (!isRecord(parsed) || parsed.defaultModel === undefined) {
+    return undefined;
+  }
+  if (typeof parsed.defaultModel !== 'string' || !parsed.defaultModel) {
+    throw new Error('Cursor SDK model list file defaultModel must be a non-empty string');
+  }
+  return parsed.defaultModel;
+}
+
+function modelListItemFromParsedYaml(value: unknown): CursorSdkModelListItem {
+  if (typeof value === 'string' && value) {
+    return value;
+  }
+  if (!isRecord(value)) {
+    throw new Error('Cursor SDK model list entries must be non-empty strings or mappings with an id');
+  }
+  if (typeof value.id !== 'string' || !value.id) {
+    throw new Error('Cursor SDK model list object entries must include a non-empty id');
+  }
+  return {
+    id: value.id,
+    ...(typeof value.name === 'string' && value.name ? { name: value.name } : {}),
+    ...(finiteNumber(value.maxContextWindow) ? { maxContextWindow: finiteNumber(value.maxContextWindow) } : {}),
+    ...(typeof value.supportsVision === 'boolean' ? { supportsVision: value.supportsVision } : {}),
+    ...(typeof value.policyState === 'string' ? { policyState: value.policyState as never } : {}),
+    ...(isRecord(value.configSchema) ? { configSchema: value.configSchema as never } : {}),
+    ...(isRecord(value._meta) ? { _meta: value._meta } : {}),
+  };
+}
+
+function modelListItemId(item: CursorSdkModelListItem): string {
+  return typeof item === 'string' ? item : item.id;
+}
+
+function sessionModelInfo(item: CursorSdkModelListItem, providerId: string): SessionModelInfo {
+  if (typeof item === 'string') {
+    return {
+      id: item,
+      provider: providerId,
+      name: item,
+    };
+  }
+  return {
+    ...item,
+    provider: providerId,
+    name: item.name ?? item.id,
   };
 }
 
