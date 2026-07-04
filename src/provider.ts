@@ -1,6 +1,5 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
-import { join as joinPath } from 'node:path';
 
 import type {
   AgentInfo,
@@ -134,32 +133,7 @@ function cursorSdkLocalStore(
     return options.store;
   }
   const dir = resolveSessionStorageDir(options.sessionStorage, context);
-  return dir ? new JsonlLocalAgentStore(sessionStorageDirPath(dir)) : undefined;
-}
-
-function sessionStorageDirPath(dir: string): string {
-  try {
-    return uriToPath(dir);
-  } catch (error) {
-    if (!dir.startsWith('file://') || !isEncodedPathSeparatorError(error)) {
-      throw error;
-    }
-    const url = new URL(dir);
-    const segments = url.pathname.split('/');
-    const encodedSessionSegment = segments.pop();
-    if (!encodedSessionSegment) {
-      throw error;
-    }
-    // Static session storage encodes the AHP session URI into one path segment.
-    // fileURLToPath rejects encoded slashes, so keep that final segment literal.
-    url.pathname = segments.join('/') || '/';
-    return joinPath(uriToPath(url.href), encodedSessionSegment);
-  }
-}
-
-function isEncodedPathSeparatorError(error: unknown): boolean {
-  return error instanceof TypeError
-    && /File URL path must not include encoded [\\/] characters/.test(error.message);
+  return dir ? new JsonlLocalAgentStore(uriToPath(dir)) : undefined;
 }
 
 interface CursorSdkModelList {

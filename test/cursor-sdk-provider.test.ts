@@ -254,7 +254,7 @@ test('Cursor SDK provider roots JsonlLocalAgentStore under a static sessionStora
 
     const rootDir = jsonlStoreRoot(runtime.agents[0]?.createOptions.local.store);
     assert.equal(rootDir.startsWith(`${directory}/`), true);
-    assert.match(rootDir, /session-ahp-session%3A%2Fcursor-session-storage-static$/);
+    assert.match(rootDir, /session-ahp-session_3A_2Fcursor-session-storage-static$/);
 
     await client.shutdown();
   } finally {
