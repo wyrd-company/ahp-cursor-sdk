@@ -17,6 +17,7 @@ import {
   type CursorSdkAgent,
   type CursorSdkCreateAgentOptions,
   type CursorSdkCustomToolResult,
+  type CursorSdkLocalAgentStore,
   type CursorSdkMessage,
   type CursorSdkRun,
   type CursorSdkRuntime,
@@ -62,6 +63,9 @@ test('Cursor SDK provider streams a local run through AHP', async () => {
 
   assert.equal(runtime.agents[0]?.createOptions.apiKey, 'cursor-test-key');
   assert.equal(runtime.agents[0]?.createOptions.local.cwd, '/workspaces/project-a');
+  assert.equal(Object.hasOwn(runtime.agents[0]?.createOptions.local ?? {}, 'store'), false);
+  assert.equal(Object.hasOwn(runtime.agents[0]?.createOptions.local ?? {}, 'stateRoot'), false);
+  assert.equal(Object.hasOwn(runtime.agents[0]?.createOptions ?? {}, 'stateRoot'), false);
   assert.equal(runtime.agents[0]?.messages[0], 'summarize');
   assert.equal(runtime.agents[0]?.sendOptions[0]?.model?.id, 'composer-2.5');
   assert.equal(events[0]?.type, 'session/turnStarted');
@@ -78,6 +82,42 @@ test('Cursor SDK provider streams a local run through AHP', async () => {
     usageRatio: 0.070495,
   }));
   assert.equal(events[4]?.type, 'session/turnComplete');
+
+  await client.shutdown();
+});
+
+test('Cursor SDK provider passes an injected local store to agent sessions', async () => {
+  const runtime = new FakeCursorRuntime();
+  const localStore = new FakeLocalAgentStore();
+  const provider = createCursorSdkProvider({ runtime, store: localStore });
+  const server = new AhpServer({ providers: [provider] });
+  const client = createClient(server);
+
+  client.connect();
+  await client.initialize({ clientId: 'cursor-client', protocolVersions: ['0.3.0'] });
+
+  const sessionUri = 'ahp-session:/cursor-local-store';
+  await client.request('createSession', {
+    channel: sessionUri,
+    provider: 'cursor-sdk',
+    workingDirectory: 'file:///workspaces/project-a',
+  });
+  const { subscription } = await client.subscribe(sessionUri);
+
+  client.dispatch(sessionUri, {
+    type: 'session/turnStarted',
+    turnId: 'turn-1',
+    message: userMessage('summarize'),
+  } as StateAction);
+
+  for (let i = 0; i < 5; i++) {
+    await nextAction(subscription);
+  }
+
+  assert.equal(runtime.agents[0]?.createOptions.local.store, localStore);
+  assert.deepEqual(localStore.agentCreates.map(agent => agent.agentId), ['cursor-agent-1']);
+  assert.deepEqual(localStore.runCreates.map(run => run.agentId), ['cursor-agent-1']);
+  assert.deepEqual(localStore.runEventAppends.map(event => event.runId), ['cursor-run-1']);
 
   await client.shutdown();
 });
@@ -207,13 +247,19 @@ test('Cursor SDK provider routes active-client tools through local customTools',
 
 test('Cursor SDK provider resumes a persisted AHP session by recreating its local agent', async () => {
   const directory = mkdtempSync(join(tmpdir(), 'ahp-cursor-resume-'));
+  const localStore = new FakeLocalAgentStore();
   const firstRuntime = new FakeCursorRuntime();
   const secondRuntime = new FakeCursorRuntime();
   const sessionUri = 'ahp-session:/cursor-resume';
 
   try {
     const firstServer = new AhpServer({
-      providers: [createCursorSdkProvider({ runtime: firstRuntime, apiKey: 'cursor-test-key', defaultModel: 'composer-test' })],
+      providers: [createCursorSdkProvider({
+        runtime: firstRuntime,
+        apiKey: 'cursor-test-key',
+        defaultModel: 'composer-test',
+        store: localStore,
+      })],
       store: new FileSystemSessionStore({ directory }),
     });
     const firstClient = createClient(firstServer);
@@ -234,7 +280,12 @@ test('Cursor SDK provider resumes a persisted AHP session by recreating its loca
     });
 
     const secondServer = new AhpServer({
-      providers: [createCursorSdkProvider({ runtime: secondRuntime, apiKey: 'cursor-test-key', defaultModel: 'composer-test' })],
+      providers: [createCursorSdkProvider({
+        runtime: secondRuntime,
+        apiKey: 'cursor-test-key',
+        defaultModel: 'composer-test',
+        store: localStore,
+      })],
       store,
     });
     const secondClient = createClient(secondServer);
@@ -247,6 +298,9 @@ test('Cursor SDK provider resumes a persisted AHP session by recreating its loca
     });
     assert.equal(reconnect.type, 'snapshot');
     assert.deepEqual(secondRuntime.resumedAgentIds, ['cursor-agent-1']);
+    assert.deepEqual(localStore.agentReads, ['cursor-agent-1']);
+    assert.equal(firstRuntime.agents[0]?.createOptions.local.store, localStore);
+    assert.equal(secondRuntime.agents[0]?.createOptions.local.store, localStore);
     assert.equal(secondRuntime.agents[0]?.createOptions.local.cwd, '/workspaces/project-a');
 
     const subscription = secondClient.attachSubscription(sessionUri);
@@ -288,14 +342,24 @@ class FakeCursorRuntime implements CursorSdkRuntime {
 
   constructor(private readonly options: FakeCursorRuntimeOptions = {}) {}
 
-  createAgent(options: CursorSdkCreateAgentOptions): CursorSdkAgent {
+  async createAgent(options: CursorSdkCreateAgentOptions): Promise<CursorSdkAgent> {
     const agent = new FakeCursorAgent(`cursor-agent-${this.agents.length + 1}`, options, this.options);
+    await options.local.store?.agents.create({
+      agent: {
+        agentId: agent.agentId,
+        cwd: options.local.cwd,
+        status: 'idle',
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    });
     this.agents.push(agent);
     return agent;
   }
 
-  resumeAgent(agentId: string, options: CursorSdkCreateAgentOptions): CursorSdkAgent {
+  async resumeAgent(agentId: string, options: CursorSdkCreateAgentOptions): Promise<CursorSdkAgent> {
     this.resumedAgentIds.push(agentId);
+    await options.local.store?.agents.get({ agentId });
     const agent = new FakeCursorAgent(agentId, options, this.options);
     this.agents.push(agent);
     return agent;
@@ -314,9 +378,25 @@ class FakeCursorAgent implements CursorSdkAgent {
     private readonly runtimeOptions: FakeCursorRuntimeOptions,
   ) {}
 
-  send(message: string, options?: CursorSdkSendOptions): CursorSdkRun {
+  async send(message: string, options?: CursorSdkSendOptions): Promise<CursorSdkRun> {
     this.messages.push(message);
     this.sendOptions.push(options ?? {});
+    const runId = `cursor-run-${this.runs.length + 1}`;
+    await this.createOptions.local.store?.runs.create({
+      run: {
+        runId,
+        agentId: this.agentId,
+        turnNumber: this.runs.length + 1,
+        status: 'finished',
+        createdAt: 1,
+        updatedAt: 1,
+      },
+    });
+    await this.createOptions.local.store?.runEvents.append({
+      runId,
+      eventType: 'test.run-started',
+      payload: { message },
+    });
     const run = new FakeCursorRun(options ?? {}, this.runtimeOptions);
     this.runs.push(run);
     return run;
@@ -383,6 +463,76 @@ class FakeCursorRun implements CursorSdkRun {
   }
 
   async cancel(): Promise<void> {}
+}
+
+class FakeLocalAgentStore implements CursorSdkLocalAgentStore {
+  readonly agentReads: string[] = [];
+  readonly agentCreates: Array<{ readonly agentId: string }> = [];
+  readonly runCreates: Array<{ readonly runId: string; readonly agentId: string }> = [];
+  readonly runEventAppends: Array<{ readonly runId: string; readonly eventType: string }> = [];
+  private readonly agentDocuments = new Map<string, any>();
+  private readonly runDocuments = new Map<string, any>();
+  private runEventSequence = 0;
+
+  readonly agents = {
+    get: async (input: { readonly agentId: string }) => {
+      this.agentReads.push(input.agentId);
+      return this.agentDocuments.get(input.agentId) ?? null;
+    },
+    create: async (input: { readonly agent: any }) => {
+      this.agentCreates.push(input.agent);
+      this.agentDocuments.set(input.agent.agentId, input.agent);
+      return input.agent;
+    },
+    update: async (input: { readonly agent: any }) => {
+      this.agentDocuments.set(input.agent.agentId, input.agent);
+      return input.agent;
+    },
+    delete: async (_input: any) => {},
+    list: async () => ({ items: [...this.agentDocuments.values()] }),
+  };
+
+  readonly checkpoints = {
+    get: async () => null,
+    create: async (_input: any) => {},
+    update: async (_input: any) => {},
+    delete: async (_input: any) => {},
+    list: async () => ({ items: [] }),
+  };
+
+  readonly runs = {
+    get: async (_input: any) => null,
+    create: async (input: { readonly run: any }) => {
+      this.runCreates.push(input.run);
+      this.runDocuments.set(input.run.runId, input.run);
+      return input.run;
+    },
+    update: async (input: { readonly run: any }) => {
+      this.runDocuments.set(input.run.runId, input.run);
+      return input.run;
+    },
+    delete: async (_input: any) => {},
+    list: async () => ({ items: [...this.runDocuments.values()] }),
+  };
+
+  readonly runEvents = {
+    append: async (input: { readonly runId: string; readonly eventType: string; readonly payload?: unknown }) => {
+      this.runEventSequence += 1;
+      this.runEventAppends.push(input);
+      return {
+        runId: input.runId,
+        seq: this.runEventSequence,
+        offset: String(this.runEventSequence),
+        eventType: input.eventType,
+        payload: input.payload,
+        payloadRef: null,
+        idempotencyKey: null,
+        createdAt: this.runEventSequence,
+      };
+    },
+    list: async () => ({ items: [] }),
+    delete: async (_input: any) => {},
+  };
 }
 
 function createClient(server: AhpServer): AhpClient {

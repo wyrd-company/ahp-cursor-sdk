@@ -8,7 +8,7 @@ This package is intentionally separate from `@wyrd-company/ahp-server` because `
 
 ## Current Status
 
-Implementation is on hold pending an upstream Cursor SDK issue. The adapter requests local agents with `Agent.create({ apiKey, local: { cwd, customTools } })`, but Cursor SDK local agent creation currently fails for free users because local model validation calls a cloud models endpoint and returns `plan_required`.
+Implementation is on hold pending an upstream Cursor SDK issue. The adapter requests local agents with `Agent.create({ apiKey, local: { cwd, store, customTools } })`, but Cursor SDK local agent creation currently fails for free users because local model validation calls a cloud models endpoint and returns `plan_required`.
 
 Reference: https://forum.cursor.com/t/agent-create-local-apikey-model-fails-for-free-users-because-local-model-validation-calls-cloud-v1-models/160839/10
 
@@ -16,6 +16,7 @@ Reference: https://forum.cursor.com/t/agent-create-local-apikey-model-fails-for-
 
 - Creates one local Cursor SDK agent per AHP session.
 - Uses the AHP session working directory as Cursor local `cwd`.
+- Optionally passes an injected Cursor SDK `LocalAgentStore` as local `store` on create and resume.
 - Sends each AHP user turn with `agent.send(...)`.
 - Maps streamed Cursor assistant text blocks to AHP markdown response parts and deltas.
 - Maps Cursor run completion to `session/turnComplete`.
@@ -49,12 +50,16 @@ does not attempt to replay or continue a half-streamed Cursor run.
 ```ts
 import { AhpServer } from '@wyrd-company/ahp-server';
 import { createCursorSdkProvider } from '@wyrd-company/ahp-cursor-sdk';
+import type { CursorSdkLocalAgentStore } from '@wyrd-company/ahp-cursor-sdk';
+
+const store: CursorSdkLocalAgentStore | undefined = undefined;
 
 const server = new AhpServer({
   providers: [
     createCursorSdkProvider({
       apiKey: process.env.CURSOR_API_KEY,
       defaultModel: process.env.CURSOR_MODEL ?? 'composer-2',
+      store,
     }),
   ],
 });

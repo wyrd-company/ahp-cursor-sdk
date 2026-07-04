@@ -4,6 +4,9 @@ import type {
   ToolDefinition,
   ToolResultContent,
 } from '@microsoft/agent-host-protocol';
+import type { LocalAgentStore as CursorSdkLocalAgentStore } from '@cursor/sdk';
+
+export type { CursorSdkLocalAgentStore };
 
 export interface CursorSdkRuntime {
   createAgent(options: CursorSdkCreateAgentOptions): Promise<CursorSdkAgent> | CursorSdkAgent;
@@ -16,6 +19,7 @@ export interface CursorSdkCreateAgentOptions {
   readonly model?: ModelSelection;
   readonly local: {
     readonly cwd: string;
+    readonly store?: CursorSdkLocalAgentStore;
     readonly customTools?: CursorSdkCustomTools;
   };
 }

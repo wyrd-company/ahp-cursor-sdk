@@ -33,6 +33,8 @@ import {
   type CursorSdkCustomToolResult,
   type CursorSdkCustomTools,
   type CursorSdkConversationTurn,
+  type CursorSdkCreateAgentOptions,
+  type CursorSdkLocalAgentStore,
   type CursorSdkMessage,
   type CursorSdkRun,
   type CursorSdkRuntime,
@@ -50,6 +52,7 @@ export interface CursorSdkProviderOptions {
   readonly description?: string;
   readonly defaultModel?: string;
   readonly agentName?: string;
+  readonly store?: CursorSdkLocalAgentStore;
   readonly localForce?: boolean;
 }
 
@@ -74,6 +77,7 @@ export function createCursorSdkProvider(options: CursorSdkProviderOptions = {}):
       agentName: options.agentName ?? 'AHP Cursor SDK',
       cwd,
       model: resumeState.model ?? model,
+      store: options.store,
       localForce: options.localForce,
       activeClientTools: context.activeClientTools,
       activeClientToolSink: context.activeClientToolSink,
@@ -105,6 +109,7 @@ interface CursorSdkAHPAgentSessionOptions {
   readonly agentName: string;
   readonly cwd: string;
   readonly model: string;
+  readonly store?: CursorSdkLocalAgentStore;
   readonly localForce?: boolean;
   readonly activeClientTools?: ActiveClientTools;
   readonly activeClientToolSink: ActiveClientToolSink;
@@ -125,12 +130,13 @@ class CursorSdkAHPAgentSession implements AgentSession {
   }
 
   async start(): Promise<void> {
-    const createOptions = {
+    const createOptions: CursorSdkCreateAgentOptions = {
       apiKey: this.options.apiKey,
       name: this.options.agentName,
       model: { id: this.options.model },
       local: {
         cwd: this.options.cwd,
+        ...(this.options.store ? { store: this.options.store } : {}),
         customTools: this.customTools(),
       },
     };

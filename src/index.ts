@@ -15,6 +15,7 @@ export type {
   CursorSdkCustomToolResult,
   CursorSdkCustomTools,
   CursorSdkJsonValue,
+  CursorSdkLocalAgentStore,
   CursorSdkMessage,
   CursorSdkRun,
   CursorSdkRunResult,
