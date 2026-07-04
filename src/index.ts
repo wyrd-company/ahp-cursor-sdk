@@ -1,5 +1,6 @@
 export { createCursorSdkProvider } from './provider.js';
 export { createCursorSdkRuntime } from './runtime.js';
+export type { SessionStorage } from '@wyrd-company/ahp-provider-kit';
 export type {
   CursorSdkModelListItem,
   CursorSdkModelListObject,

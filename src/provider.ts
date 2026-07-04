@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
+import { join as joinPath } from 'node:path';
 
 import type {
   AgentInfo,
@@ -13,6 +14,7 @@ import type {
 import {
   ActiveClientToolRouter,
   MarkdownTurnEmitter,
+  resolveSessionStorageDir,
   resolveModelId,
   uriToPath,
   type ActiveClientTools,
@@ -24,7 +26,9 @@ import {
   type ProviderResumeState,
   type ResumableAgentProvider,
   type ResumableAgentSessionContext,
+  type SessionStorage,
 } from '@wyrd-company/ahp-provider-kit';
+import { JsonlLocalAgentStore } from '@cursor/sdk';
 import { parse as parseYaml } from 'yaml';
 
 import { createCursorSdkRuntime } from './runtime.js';
@@ -57,6 +61,7 @@ export interface CursorSdkProviderOptions {
   readonly modelListFile?: string;
   readonly agentName?: string;
   readonly store?: CursorSdkLocalAgentStore;
+  readonly sessionStorage?: SessionStorage;
   readonly localForce?: boolean;
 }
 
@@ -93,13 +98,14 @@ export function createCursorSdkProvider(options: CursorSdkProviderOptions = {}):
     const cwd = context.workingDirectory ? uriToPath(context.workingDirectory) : process.cwd();
     const model = resolveModelId(context.model, defaultModel);
     const resumeState = resumeStateFromContext(context);
+    const store = cursorSdkLocalStore(options, context);
     const session = new CursorSdkAHPAgentSession({
       runtime,
       apiKey: options.apiKey ?? process.env.CURSOR_API_KEY,
       agentName: options.agentName ?? 'AHP Cursor SDK',
       cwd,
       model: resumeState.model ?? model,
-      store: options.store,
+      store,
       localForce: options.localForce,
       activeClientTools: context.activeClientTools,
       activeClientToolSink: context.activeClientToolSink,
@@ -118,6 +124,42 @@ export function createCursorSdkProvider(options: CursorSdkProviderOptions = {}):
       return createRuntimeSession(context);
     },
   };
+}
+
+function cursorSdkLocalStore(
+  options: CursorSdkProviderOptions,
+  context: AgentSessionContext | ResumableAgentSessionContext,
+): CursorSdkLocalAgentStore | undefined {
+  if (options.store) {
+    return options.store;
+  }
+  const dir = resolveSessionStorageDir(options.sessionStorage, context);
+  return dir ? new JsonlLocalAgentStore(sessionStorageDirPath(dir)) : undefined;
+}
+
+function sessionStorageDirPath(dir: string): string {
+  try {
+    return uriToPath(dir);
+  } catch (error) {
+    if (!dir.startsWith('file://') || !isEncodedPathSeparatorError(error)) {
+      throw error;
+    }
+    const url = new URL(dir);
+    const segments = url.pathname.split('/');
+    const encodedSessionSegment = segments.pop();
+    if (!encodedSessionSegment) {
+      throw error;
+    }
+    // Static session storage encodes the AHP session URI into one path segment.
+    // fileURLToPath rejects encoded slashes, so keep that final segment literal.
+    url.pathname = segments.join('/') || '/';
+    return joinPath(uriToPath(url.href), encodedSessionSegment);
+  }
+}
+
+function isEncodedPathSeparatorError(error: unknown): boolean {
+  return error instanceof TypeError
+    && /File URL path must not include encoded [\\/] characters/.test(error.message);
 }
 
 interface CursorSdkModelList {

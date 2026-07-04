@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { after, test } from 'node:test';
 
+import { JsonlLocalAgentStore } from '@cursor/sdk';
 import type { Message, StateAction, ToolDefinition } from '@microsoft/agent-host-protocol';
 import { AhpClient } from '@microsoft/agent-host-protocol/client';
 import {
@@ -22,6 +24,7 @@ import {
   type CursorSdkRun,
   type CursorSdkRuntime,
   type CursorSdkSendOptions,
+  type SessionStorage,
 } from '../src/index.js';
 
 const runningServers: Array<Promise<void>> = [];
@@ -229,6 +232,127 @@ test('Cursor SDK provider passes an injected local store to agent sessions', asy
   await client.shutdown();
 });
 
+test('Cursor SDK provider roots JsonlLocalAgentStore under a static sessionStorage URI', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-cursor-session-storage-'));
+  const runtime = new FakeCursorRuntime();
+  const provider = createCursorSdkProvider({
+    runtime,
+    sessionStorage: pathToFileURL(directory).href,
+  });
+  const server = new AhpServer({ providers: [provider] });
+  const client = createClient(server);
+
+  try {
+    client.connect();
+    await client.initialize({ clientId: 'cursor-client', protocolVersions: ['0.3.0'] });
+
+    await client.request('createSession', {
+      channel: 'ahp-session:/cursor-session-storage-static',
+      provider: 'cursor-sdk',
+      workingDirectory: 'file:///workspaces/project-a',
+    });
+
+    const rootDir = jsonlStoreRoot(runtime.agents[0]?.createOptions.local.store);
+    assert.equal(rootDir.startsWith(`${directory}/`), true);
+    assert.match(rootDir, /session-ahp-session%3A%2Fcursor-session-storage-static$/);
+
+    await client.shutdown();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Cursor SDK provider resolves sessionStorage functions with the session context', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-cursor-session-storage-'));
+  const runtime = new FakeCursorRuntime();
+  let seenContext: { readonly sessionUri?: string; readonly workingDirectory?: string } | undefined;
+  const returnedDirectory = join(directory, 'resolver-returned');
+  const sessionStorage: SessionStorage = context => {
+    seenContext = {
+      sessionUri: context.sessionUri,
+      workingDirectory: context.workingDirectory,
+    };
+    return pathToFileURL(returnedDirectory).href;
+  };
+  const provider = createCursorSdkProvider({ runtime, sessionStorage });
+  const server = new AhpServer({ providers: [provider] });
+  const client = createClient(server);
+
+  try {
+    client.connect();
+    await client.initialize({ clientId: 'cursor-client', protocolVersions: ['0.3.0'] });
+
+    await client.request('createSession', {
+      channel: 'ahp-session:/cursor-session-storage-resolver',
+      provider: 'cursor-sdk',
+      workingDirectory: 'file:///workspaces/project-a',
+    });
+
+    assert.deepEqual(seenContext, {
+      sessionUri: 'ahp-session:/cursor-session-storage-resolver',
+      workingDirectory: 'file:///workspaces/project-a',
+    });
+    assert.equal(jsonlStoreRoot(runtime.agents[0]?.createOptions.local.store), returnedDirectory);
+
+    await client.shutdown();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Cursor SDK provider omits local store when sessionStorage resolves undefined', async () => {
+  const runtime = new FakeCursorRuntime();
+  const provider = createCursorSdkProvider({
+    runtime,
+    sessionStorage: () => undefined,
+  });
+  const server = new AhpServer({ providers: [provider] });
+  const client = createClient(server);
+
+  client.connect();
+  await client.initialize({ clientId: 'cursor-client', protocolVersions: ['0.3.0'] });
+
+  await client.request('createSession', {
+    channel: 'ahp-session:/cursor-session-storage-undefined',
+    provider: 'cursor-sdk',
+    workingDirectory: 'file:///workspaces/project-a',
+  });
+
+  assert.equal(Object.hasOwn(runtime.agents[0]?.createOptions.local ?? {}, 'store'), false);
+
+  await client.shutdown();
+});
+
+test('Cursor SDK provider prefers an injected local store over sessionStorage', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-cursor-session-storage-'));
+  const runtime = new FakeCursorRuntime();
+  const localStore = new FakeLocalAgentStore();
+  const provider = createCursorSdkProvider({
+    runtime,
+    store: localStore,
+    sessionStorage: pathToFileURL(directory).href,
+  });
+  const server = new AhpServer({ providers: [provider] });
+  const client = createClient(server);
+
+  try {
+    client.connect();
+    await client.initialize({ clientId: 'cursor-client', protocolVersions: ['0.3.0'] });
+
+    await client.request('createSession', {
+      channel: 'ahp-session:/cursor-session-storage-precedence',
+      provider: 'cursor-sdk',
+      workingDirectory: 'file:///workspaces/project-a',
+    });
+
+    assert.equal(runtime.agents[0]?.createOptions.local.store, localStore);
+
+    await client.shutdown();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('Cursor SDK provider routes active-client tools through local customTools', async () => {
   const runtime = new FakeCursorRuntime({
     toolCall: {
@@ -432,6 +556,73 @@ test('Cursor SDK provider resumes a persisted AHP session by recreating its loca
     await secondClient.shutdown();
   } finally {
     rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('Cursor SDK provider resumes with a JsonlLocalAgentStore rooted at the original sessionStorage directory', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'ahp-cursor-resume-'));
+  const sessionStorageDirectory = mkdtempSync(join(tmpdir(), 'ahp-cursor-session-storage-'));
+  const firstRuntime = new FakeCursorRuntime();
+  const secondRuntime = new FakeCursorRuntime();
+  const sessionUri = 'ahp-session:/cursor-session-storage-resume';
+  const sessionStorage = pathToFileURL(sessionStorageDirectory).href;
+
+  try {
+    const firstServer = new AhpServer({
+      providers: [createCursorSdkProvider({
+        runtime: firstRuntime,
+        apiKey: 'cursor-test-key',
+        defaultModel: 'composer-test',
+        sessionStorage,
+      })],
+      store: new FileSystemSessionStore({ directory }),
+    });
+    const firstClient = createClient(firstServer);
+    firstClient.connect();
+    await firstClient.initialize({ clientId: 'cursor-client', protocolVersions: ['0.3.0'] });
+    await firstClient.request('createSession', {
+      channel: sessionUri,
+      provider: 'cursor-sdk',
+      workingDirectory: 'file:///workspaces/project-a',
+      model: { id: 'composer-test' },
+    });
+    await firstClient.shutdown();
+
+    const store = new FileSystemSessionStore({ directory });
+    assert.deepEqual(store.getSession(sessionUri)?.providerResumeState, {
+      agentId: 'cursor-agent-1',
+      model: 'composer-test',
+    });
+
+    const secondServer = new AhpServer({
+      providers: [createCursorSdkProvider({
+        runtime: secondRuntime,
+        apiKey: 'cursor-test-key',
+        defaultModel: 'composer-test',
+        sessionStorage,
+      })],
+      store,
+    });
+    const secondClient = createClient(secondServer);
+    secondClient.connect();
+
+    const reconnect = await secondClient.reconnect({
+      clientId: 'cursor-client',
+      lastSeenServerSeq: 0,
+      subscriptions: [sessionUri],
+    });
+
+    assert.equal(reconnect.type, 'snapshot');
+    assert.deepEqual(secondRuntime.resumedAgentIds, ['cursor-agent-1']);
+    assert.equal(
+      jsonlStoreRoot(secondRuntime.agents[0]?.createOptions.local.store),
+      jsonlStoreRoot(firstRuntime.agents[0]?.createOptions.local.store),
+    );
+
+    await secondClient.shutdown();
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+    rmSync(sessionStorageDirectory, { recursive: true, force: true });
   }
 });
 
@@ -646,6 +837,11 @@ function createClient(server: AhpServer): AhpClient {
   const [clientTransport, serverTransport] = createInMemoryTransportPair();
   runningServers.push(server.accept(serverTransport));
   return new AhpClient(clientTransport, { requestTimeoutMs: 1_000 });
+}
+
+function jsonlStoreRoot(store: CursorSdkLocalAgentStore | undefined): string {
+  assert.ok(store instanceof JsonlLocalAgentStore);
+  return (store as unknown as { readonly rootDir: string }).rootDir;
 }
 
 function assistantMessage(text: string): CursorSdkMessage {

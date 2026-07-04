@@ -20,6 +20,7 @@ Reference: https://forum.cursor.com/t/agent-create-local-apikey-model-fails-for-
 - Advertises configured models from `models`, `modelListFile`, or `CURSOR_MODEL_LIST_FILE`; otherwise advertises `composer-2.5`.
 - Uses the AHP session working directory as Cursor local `cwd`.
 - Optionally passes an injected Cursor SDK `LocalAgentStore` as local `store` on create and resume.
+- Optionally resolves `sessionStorage` to a per-session directory and creates a Cursor SDK `JsonlLocalAgentStore` rooted there.
 - Sends each AHP user turn with `agent.send(...)`.
 - Maps streamed Cursor assistant text blocks to AHP markdown response parts and deltas.
 - Maps Cursor run completion to `session/turnComplete`.
@@ -48,14 +49,40 @@ after an AHP server restart.
 This preserves the Cursor local agent identity for future turns. The adapter
 does not attempt to replay or continue a half-streamed Cursor run.
 
+## Session Storage
+
+Hosts can provide `sessionStorage` to persist Cursor SDK local store content under
+an AHP session-specific directory. Static storage URIs are treated as roots; the
+provider-kit `resolveSessionStorageDir(...)` helper appends the per-session
+directory. Resolver functions receive the AHP session context and return the
+final directory URI.
+
+When `sessionStorage` resolves to a directory, the adapter passes
+`new JsonlLocalAgentStore(...)` as Cursor SDK `local.store`, rooted at the
+resolved directory's filesystem path. Static `file://` roots keep the encoded
+session segment as one literal path segment so AHP session URIs containing `/`
+remain portable directory names. The installed `@cursor/sdk` typings expose the
+constructor as `new JsonlLocalAgentStore(rootDir: string)`, so the adapter passes
+a plain filesystem path, not an options object.
+
+Storage precedence is:
+
+1. Factory `store`
+2. `sessionStorage`
+3. Cursor SDK default storage
+
+Providing both `store` and `sessionStorage` is allowed. The factory `store` wins
+silently.
+
 ## Usage
 
 ```ts
 import { AhpServer } from '@wyrd-company/ahp-server';
 import { createCursorSdkProvider } from '@wyrd-company/ahp-cursor-sdk';
-import type { CursorSdkLocalAgentStore } from '@wyrd-company/ahp-cursor-sdk';
+import type { CursorSdkLocalAgentStore, SessionStorage } from '@wyrd-company/ahp-cursor-sdk';
 
 const store: CursorSdkLocalAgentStore | undefined = undefined;
+const sessionStorage: SessionStorage | undefined = process.env.AHP_SESSION_STORAGE_ROOT;
 
 const server = new AhpServer({
   providers: [
@@ -63,6 +90,7 @@ const server = new AhpServer({
       apiKey: process.env.CURSOR_API_KEY,
       defaultModel: process.env.CURSOR_MODEL ?? 'composer-2',
       store,
+      sessionStorage,
       modelListFile: process.env.CURSOR_MODEL_LIST_FILE,
     }),
   ],
